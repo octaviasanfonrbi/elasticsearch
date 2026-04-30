@@ -112,6 +112,16 @@ EXPORT int32_t vec_doti7u_2(const int8_t* a, const int8_t* b, const int32_t dims
  *
  * The single-pair scorer `dot7u_inner` above uses the same dim-axis pattern
  * under its local `batches` constant.
+ *
+ * Prefetch strategy (head + spread):
+ *   - At each batch boundary, software-prefetches the first `unroll_dim`
+ *     cache lines of every next-batch vector so the very first inner-loop
+ *     iter never waits on a demand miss.
+ *   - At each inner iter, software-prefetches the next `unroll_dim` lines
+ *     (the lines that the *next* outer iter will consume) of every
+ *     next-batch vector. Spreading the issues across the inner loop keeps
+ *     the L1d fill buffer occupancy below the per-core ceiling and lets the
+ *     prefetched lines arrive ~1 outer iter before they are used.
  */
 template <
     typename TData,
@@ -140,7 +150,10 @@ static inline void dot7u_bulk_avx512(
         if (has_next) {
             apply_indexed<batches>([&](auto I) {
                 next_vecs[I] = mapper(a, c + batches + I, offsets, pitch);
-                prefetch(next_vecs[I], lines_to_fetch);
+                const uintptr_t base = align_downwards<CACHE_LINE_SIZE>(next_vecs[I]);
+                apply_indexed<unroll_dim>([&](auto K) {
+                    _mm_prefetch((const void*)(base + K * CACHE_LINE_SIZE), _MM_HINT_T0);
+                });
             });
         }
 
@@ -154,6 +167,18 @@ static inline void dot7u_bulk_avx512(
 
         int i = 0;
         for (; i + dimStride <= blk; i += dimStride) {
+            if (has_next) {
+                const int next_line_start = i / CACHE_LINE_SIZE + unroll_dim;
+                apply_indexed<unroll_dim>([&](auto U) {
+                    const int line = next_line_start + U;
+                    if (line < lines_to_fetch) {
+                        apply_indexed<batches>([&](auto I) {
+                            const uintptr_t base = align_downwards<CACHE_LINE_SIZE>(next_vecs[I]);
+                            _mm_prefetch((const void*)(base + line * CACHE_LINE_SIZE), _MM_HINT_T0);
+                        });
+                    }
+                });
+            }
             apply_indexed<unroll_dim>([&](auto U) {
                 __m512i bv = _mm512_loadu_si512((const __m512i*)(b + i + U * stride));
                 apply_indexed<batches>([&](auto I) {
@@ -173,6 +198,15 @@ static inline void dot7u_bulk_avx512(
                 acc[I] = tree_reduce<unroll_dim, __m512i, _mm512_add_epi32>(&acc[I * unroll_dim]);
             });
             for (; i + stride <= blk; i += stride) {
+                if (has_next) {
+                    const int line = i / CACHE_LINE_SIZE + 1;
+                    if (line < lines_to_fetch) {
+                        apply_indexed<batches>([&](auto I) {
+                            const uintptr_t base = align_downwards<CACHE_LINE_SIZE>(next_vecs[I]);
+                            _mm_prefetch((const void*)(base + line * CACHE_LINE_SIZE), _MM_HINT_T0);
+                        });
+                    }
+                }
                 __m512i bv = _mm512_loadu_si512((const __m512i*)(b + i));
                 apply_indexed<batches>([&](auto I) {
                     __m512i av = _mm512_loadu_si512((const __m512i*)(current_vecs[I] + i));
@@ -323,6 +357,9 @@ EXPORT int32_t vec_sqri7u_2(const int8_t* a, const int8_t* b, const int32_t dims
  * already saturates the issue ports at one accumulator per batch on Sapphire
  * Rapids, so a dim-axis unroll would only add register pressure without
  * throughput. Only the batch-axis (shared-b) parallelism is applied.
+ *
+ * Prefetch strategy: see dot7u_bulk_avx512. Inner step is one cache line per
+ * iter, so this kernel uses head=1 + 1-line spread per iter.
  */
 template <
     typename TData,
@@ -349,7 +386,8 @@ static inline void sqr7u_bulk_avx512(
         if (has_next) {
             apply_indexed<batches>([&](auto I) {
                 next_vecs[I] = mapper(a, c + batches + I, offsets, pitch);
-                prefetch(next_vecs[I], lines_to_fetch);
+                const uintptr_t base = align_downwards<CACHE_LINE_SIZE>(next_vecs[I]);
+                _mm_prefetch((const void*)base, _MM_HINT_T0);
             });
         }
 
@@ -359,7 +397,14 @@ static inline void sqr7u_bulk_avx512(
         });
 
         int i = 0;
-        for (; i + stride <= blk; i += stride) {
+        int line_idx = 0;
+        for (; i + stride <= blk; i += stride, ++line_idx) {
+            if (has_next && line_idx + 1 < lines_to_fetch) {
+                apply_indexed<batches>([&](auto I) {
+                    const uintptr_t base = align_downwards<CACHE_LINE_SIZE>(next_vecs[I]);
+                    _mm_prefetch((const void*)(base + (line_idx + 1) * CACHE_LINE_SIZE), _MM_HINT_T0);
+                });
+            }
             __m512i bv = _mm512_loadu_si512((const __m512i*)(b + i));
             apply_indexed<batches>([&](auto I) {
                 __m512i av = _mm512_loadu_si512((const __m512i*)(current_vecs[I] + i));
